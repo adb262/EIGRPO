@@ -1,0 +1,19 @@
+tools:
+  - class_name: "eigrpo.environments.gsm8k_env.GSM8KTool"
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: calc_gsm8k_reward
+        description: >
+          Submit your answer to the GSM8K math problem.
+          The tool will evaluate it and return the current reward.
+        parameters:
+          type: object
+          properties:
+            answer:
+              type: string
+              description: "The numeric answer to the question"
+          required:
+            - answer
