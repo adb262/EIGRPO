@@ -56,11 +56,17 @@ class LoggingConfig:
         rollout_table_freq: Log a wandb table of rollout samples every N
             training steps. ``0`` disables table logging.  Step 0 is always
             skipped regardless.
-        rollout_table_max_rows: Maximum number of rows per table snapshot.
+        rollout_table_max_rows: Maximum number of rows per table snapshot
+            (legacy field, unused by the selection table).
+        rollout_table_max_groups: Maximum number of prompt groups to include
+            in the selection table.  Each group contributes G rows (one per
+            rollout), so the total row count is at most
+            ``rollout_table_max_groups * G``.
     """
 
     rollout_table_freq: int = 0
     rollout_table_max_rows: int = 32
+    rollout_table_max_groups: int = 2
 
 
 @dataclass
@@ -106,6 +112,7 @@ def parse_eigrpo_config(raw_config: Any) -> EIGRPOConfig:
     logging_cfg = LoggingConfig(
         rollout_table_freq=cfg.get("logging", {}).get("rollout_table_freq", 0),
         rollout_table_max_rows=cfg.get("logging", {}).get("rollout_table_max_rows", 32),
+        rollout_table_max_groups=cfg.get("logging", {}).get("rollout_table_max_groups", 2),
     )
 
     return EIGRPOConfig(

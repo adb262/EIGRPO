@@ -7,11 +7,13 @@ Overrides verl's default ``TaskRunner.run()`` to instantiate
 
 from __future__ import annotations
 
+import logging
 from pprint import pprint
 
 from omegaconf import OmegaConf
 
 from eigrpo.trainers.eigrpo_trainer import EIGRPOTrainer
+from eigrpo.utils.logging import configure_logging
 from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -27,6 +29,9 @@ class EIGRPOTaskRunner(TaskRunner):
     """
 
     def run(self, config):
+        configure_logging()
+        logger = logging.getLogger("eigrpo.task_runner")
+        logger.info("EIGRPOTaskRunner.run() started in worker pid=%d", __import__("os").getpid())
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 

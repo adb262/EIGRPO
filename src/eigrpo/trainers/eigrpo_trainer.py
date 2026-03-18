@@ -7,9 +7,10 @@ from the effective sample size (expensive backward pass).
 """
 
 from __future__ import annotations
-from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode, compute_rollout_correction_and_add_to_batch
+
 import importlib
 import logging
+import time
 import uuid
 from copy import deepcopy
 from pprint import pprint
@@ -26,6 +27,7 @@ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.trainer.ppo.reward import compute_reward_async
+from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode, compute_rollout_correction_and_add_to_batch
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
@@ -33,7 +35,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.tracking import Tracking
 
 from eigrpo.config import EIGRPOConfig, parse_eigrpo_config
-from eigrpo.diversity.metrics import compute_unique_trajectory_ratio
+from eigrpo.diversity.metrics import compute_jacobian_rank, compute_unique_trajectory_ratio
 from eigrpo.sampling.base_selector import BaseTrajectorySelector, TrajectoryBatch
 from eigrpo.trainers.rollout_batch import RolloutBatch
 from eigrpo.utils.metrics import compute_entropy, compute_mastery_pct, compute_min_log_prob
@@ -95,6 +97,9 @@ class EIGRPOTrainer(RayPPOTrainer):
 
         rewards = rollout.token_level_rewards.sum(dim=-1)
         metrics.update(compute_mastery_pct(rewards, rollout.uids))
+        metrics["reward/pre_mean"] = rewards.mean().item()
+        metrics["reward/pre_min"] = rewards.min().item()
+        metrics["reward/pre_max"] = rewards.max().item()
 
         return metrics
 
@@ -102,8 +107,23 @@ class EIGRPOTrainer(RayPPOTrainer):
     # Rollout table logging
     # ------------------------------------------------------------------
 
-    def _log_rollout_table(self, batch: DataProto, step: int) -> None:
-        """Log a wandb Table with a sample of rollouts from the current step."""
+    def _log_selection_table(
+        self,
+        batch: DataProto,
+        selected: list[int],
+        step: int,
+    ) -> None:
+        """Log a wandb Table showing every rollout and whether it was selected.
+
+        Each row corresponds to one rollout.  The ``selected`` column lets
+        readers see exactly which rollouts the sampler kept vs. dropped for
+        every prompt group shown.
+
+        Skips silently when wandb is not active or the frequency guard fires.
+        """
+        freq = self._eigrpo_config.logging.rollout_table_freq
+        if freq <= 0 or step % freq != 0:
+            return
         try:
             import wandb
         except ImportError:
@@ -111,19 +131,36 @@ class EIGRPOTrainer(RayPPOTrainer):
         if wandb.run is None:
             return
 
+        G = self.config.actor_rollout_ref.rollout.n
+        n_total = batch.batch.batch_size[0]
+        P = n_total // G
+        max_groups = self._eigrpo_config.logging.rollout_table_max_groups
+        n_groups = min(P, max_groups)
+
         prompts = batch.batch["prompts"]
         responses = batch.batch["responses"]
         scores = batch.batch["token_level_scores"].sum(-1)
+        selected_set = set(selected)
 
-        max_rows = self._eigrpo_config.logging.rollout_table_max_rows
-        n = min(len(prompts), max_rows)
+        columns = ["step", "group", "rollout", "prompt", "response", "score", "selected"]
+        table = wandb.Table(columns=columns)
 
-        table = wandb.Table(columns=["step", "prompt", "response", "score"])
-        for i in range(n):
-            prompt_str = self.tokenizer.decode(prompts[i], skip_special_tokens=True)
-            response_str = self.tokenizer.decode(responses[i], skip_special_tokens=True)
-            table.add_data(step, prompt_str, response_str, scores[i].item())
-        wandb.log({"eigrpo/rollout_samples": table}, step=step)
+        for p in range(n_groups):
+            prompt_str = self.tokenizer.decode(prompts[p * G], skip_special_tokens=True)
+            for r in range(G):
+                idx = p * G + r
+                response_str = self.tokenizer.decode(responses[idx], skip_special_tokens=True)
+                table.add_data(
+                    step,
+                    p,
+                    r,
+                    prompt_str,
+                    response_str,
+                    scores[idx].item(),
+                    idx in selected_set,
+                )
+
+        wandb.log({"eigrpo/selection_table": table}, step=step)
 
     # ------------------------------------------------------------------
     # Selection hook
@@ -141,34 +178,75 @@ class EIGRPOTrainer(RayPPOTrainer):
         metrics: dict[str, float] = self._collect_rollout_metrics(rollout)
         metrics["n_rollouts"] = float(n_total)
 
+        rewards = rollout.token_level_rewards.sum(dim=-1)
+
+        if rollout.old_log_probs is not None and rollout.response_mask is not None:
+            pre_rank = compute_jacobian_rank(
+                rollout.old_log_probs,
+                rollout.response_mask,
+                rewards=rewards,
+            )
+            metrics.update({f"jacobian/pre_{k}": v for k, v in pre_rank.items()})
+
         n_select = self._eigrpo_config.selector.n_effective_samples
         if n_select is None or n_select >= n_total:
             metrics["effective_batch_size"] = float(n_total)
+            if rollout.old_log_probs is not None and rollout.response_mask is not None:
+                metrics.update({f"jacobian/post_{k}": v for k, v in pre_rank.items()})
+            # No selection occurred — post stats equal pre stats.
+            metrics["reward/post_mean"] = metrics["reward/pre_mean"]
+            metrics["reward/post_min"] = metrics["reward/pre_min"]
+            metrics["reward/post_max"] = metrics["reward/pre_max"]
+            self._log_selection_table(batch, list(range(n_total)), step)
             return batch, metrics
 
-        rewards = rollout.token_level_rewards.sum(dim=-1)
-
         trajectories: list[list[dict]] = [[] for _ in range(n_total)]
+        response_texts: list[str] | None = None
+        token_sequences: list[list[int]] | None = None
+        if rollout.responses is not None:
+            token_sequences = rollout.responses.tolist()
+            response_texts = self.tokenizer.batch_decode(rollout.responses, skip_special_tokens=True)
 
         tb = TrajectoryBatch(
             rollout_ids=rollout.uids,
             trajectories=trajectories,
             rewards=rewards,
+            group_size=self.config.actor_rollout_ref.rollout.n,
+            token_sequences=token_sequences,
             log_probs=rollout.old_log_probs,
+            response_texts=response_texts,
         )
 
+        _t0 = time.perf_counter()
         selected = self._selector.select(tb, n_select)
+        metrics["selection/embed_time_s"] = time.perf_counter() - _t0
+        self._log_selection_table(batch, selected, step)
 
         metrics["selection/n_total_rollouts"] = float(n_total)
         metrics["selection/n_selected"] = float(len(selected))
         metrics["effective_batch_size"] = float(len(selected))
 
-        if self._eigrpo_config.diversity.log_trajectory_similarity and rollout.responses is not None:
-            token_seqs = rollout.responses.tolist()
-            metrics["diversity/unique_trajectory_ratio"] = compute_unique_trajectory_ratio(token_seqs)
+        if self._eigrpo_config.diversity.log_trajectory_similarity and token_sequences is not None:
+            metrics["diversity/unique_trajectory_ratio"] = compute_unique_trajectory_ratio(token_sequences)
 
         selected_t = torch.tensor(selected, dtype=torch.long)
-        return rollout.select_indices(selected_t), metrics
+        filtered_batch = rollout.select_indices(selected_t)
+
+        filtered_rollout = RolloutBatch(filtered_batch)
+        post_rewards = filtered_rollout.token_level_rewards.sum(dim=-1)
+        metrics["reward/post_mean"] = post_rewards.mean().item()
+        metrics["reward/post_min"] = post_rewards.min().item()
+        metrics["reward/post_max"] = post_rewards.max().item()
+
+        if filtered_rollout.old_log_probs is not None and filtered_rollout.response_mask is not None:
+            post_rank = compute_jacobian_rank(
+                filtered_rollout.old_log_probs,
+                filtered_rollout.response_mask,
+                rewards=post_rewards,
+            )
+            metrics.update({f"jacobian/post_{k}": v for k, v in post_rank.items()})
+
+        return filtered_batch, metrics
 
     # ------------------------------------------------------------------
     # Training loop
@@ -238,13 +316,15 @@ class EIGRPOTrainer(RayPPOTrainer):
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object,
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                    dtype=object,
                 )
 
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True,
+                    repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    interleave=True,
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -281,7 +361,9 @@ class EIGRPOTrainer(RayPPOTrainer):
                                 batch = batch.union(rm_scores)
 
                             reward_baseline_tensor = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, sum_reward=True,
+                                batch,
+                                reward_fn=self.reward_fn,
+                                sum_reward=True,
                             )
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
@@ -313,11 +395,15 @@ class EIGRPOTrainer(RayPPOTrainer):
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer,
+                                data=batch,
+                                config=self.config,
+                                tokenizer=self.tokenizer,
                             )
                         else:
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, return_dict=False,
+                                batch,
+                                reward_fn=self.reward_fn,
+                                return_dict=False,
                             )
 
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
@@ -375,7 +461,9 @@ class EIGRPOTrainer(RayPPOTrainer):
 
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty,
+                                batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
                             )
                             metrics.update(kl_metrics)
                         else:
@@ -390,20 +478,23 @@ class EIGRPOTrainer(RayPPOTrainer):
                             metrics.update(is_metrics)
 
                         # ── EIGRPO: selection + metrics ──────────────
-                        _table_freq = self._eigrpo_config.logging.rollout_table_freq
-                        if _table_freq > 0 and self.global_steps % _table_freq == 0:
-                            self._log_rollout_table(batch, self.global_steps)
-                        batch, eigrpo_metrics = self._apply_selection(batch, self.global_steps)
+                        with marked_timer("selection", timing_raw):
+                            batch, eigrpo_metrics = self._apply_selection(batch, self.global_steps)
                         metrics.update({f"eigrpo/{k}": v for k, v in eigrpo_metrics.items()})
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
 
+                        # After selection each prompt has n_effective_samples rollouts;
+                        # fall back to rollout.n when selection is disabled.
+                        n_after = (
+                            self._eigrpo_config.selector.n_effective_samples or self.config.actor_rollout_ref.rollout.n
+                        )
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            num_repeat=n_after,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
@@ -464,10 +555,12 @@ class EIGRPOTrainer(RayPPOTrainer):
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-                metrics.update({
-                    "training/global_step": self.global_steps,
-                    "training/epoch": epoch,
-                })
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -486,7 +579,8 @@ class EIGRPOTrainer(RayPPOTrainer):
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
                 ):
                     self.actor_rollout_wg.dump_memory_snapshot(
-                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}",
+                        tag=f"post_update_step{self.global_steps}",
+                        sub_dir=f"step{self.global_steps}",
                     )
 
                 if is_last_step:

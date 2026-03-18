@@ -22,23 +22,22 @@ import sys
 from pathlib import Path
 
 import ray
+import verl.trainer.main_ppo as _mod
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf, flag_override
+from verl.trainer.main_ppo import run_ppo
 
 from eigrpo.data.gsm8k import prepare as prepare_gsm8k_data
 from eigrpo.trainers.task_runner import EIGRPOTaskRunner
-from verl.trainer.main_ppo import run_ppo
-import verl.trainer.main_ppo as _mod
+from eigrpo.utils.logging import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(name)-24s  %(levelname)-8s  %(message)s",
-)
+configure_logging()
 logger = logging.getLogger("eigrpo.run")
+
 
 def _verl_config_dir() -> str:
     """Locate verl's Hydra config directory at runtime."""
-    
+
     return str(Path(_mod.__file__).resolve().parent / "config")
 
 
@@ -74,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Directory for prepared GSM8K parquet files (auto-created if missing)",
     )
     args, overrides = parser.parse_known_args(argv)
+    logger.info("Starting EIGRPO training...")
 
     config_path = Path(args.config)
     if not config_path.exists():

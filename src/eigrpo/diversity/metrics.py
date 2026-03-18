@@ -11,6 +11,58 @@ import torch
 import torch.nn as nn
 
 
+def compute_jacobian_rank(
+    log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    rewards: torch.Tensor | None = None,
+    threshold: float = 0.01,
+) -> dict[str, float]:
+    """Estimate the rank of the gradient Jacobian from the log-probability matrix.
+
+    In GRPO the per-rollout gradient is ``A_i * ∇_θ log π_θ(o_i | q)``.
+    The log-probability matrix (N, seq_len) is used as a tractable proxy:
+    rollouts whose log-prob rows are linearly independent will produce
+    linearly independent gradients, so rank(L) ≤ rank(J).  Optionally
+    weight each row by ``|reward_i|`` to approximate the magnitude-weighted
+    Jacobian ``diag(|A|) * J``.
+
+    Returns both the numerical rank (singular values above
+    ``threshold * σ_max``) and the Roy–Vetterli effective rank
+    ``exp(H(σ̂))`` — the exponential of the normalised singular-value
+    entropy, which gives a continuous, noise-robust measure of
+    dimensionality in ``[1, N]``.
+
+    Parameters
+    ----------
+    log_probs:
+        Shape ``(N, seq_len)`` — token-level log-probabilities.
+    response_mask:
+        Shape ``(N, seq_len)`` — 1 for response tokens, 0 elsewhere.
+    rewards:
+        Shape ``(N,)`` — optional per-rollout scalar rewards used to
+        weight rows before the SVD.
+    threshold:
+        Fraction of the largest singular value below which a singular
+        value is treated as zero for the numerical rank computation.
+    """
+    masked = (log_probs * response_mask).float()              # (N, seq_len)
+    col_active = response_mask.any(dim=0)
+    masked = masked[:, col_active]                            # (N, active_len)
+
+    if rewards is not None:
+        masked = masked * rewards.float().abs().unsqueeze(1)  # (N, active_len)
+
+    sv = torch.linalg.svdvals(masked)                         # (min(N, L),)
+
+    rank = int((sv > threshold * sv[0]).sum().item())
+
+    sv_norm = sv / sv.sum().clamp(min=1e-12)
+    entropy = -(sv_norm * (sv_norm + 1e-10).log()).sum()
+    effective_rank = float(entropy.exp().item())
+
+    return {"rank": float(rank), "effective_rank": effective_rank}
+
+
 def compute_trajectory_similarity(
     token_sequences: list[list[int]],
 ) -> torch.Tensor:
@@ -92,24 +144,21 @@ def compute_per_rollout_gradient_norms(
 
 
 def compute_unique_trajectory_ratio(token_sequences: list[list[int]], threshold: float = 0.95) -> float:
-    """Fraction of rollouts that are *not* near-duplicates of an earlier one.
+    """Fraction of rollouts with a distinct token sequence.
 
-    Two trajectories are considered duplicates when their LCS-based
-    similarity exceeds ``threshold``.
+    Uses hash-based exact deduplication — O(n * L) — instead of the
+    O(n^2 * L^2) pairwise LCS approach used by
+    :func:`compute_trajectory_similarity`.  Exact match is the right
+    tradeoff for the hot training loop: LCS near-duplicate detection at
+    n=1024, L=2048 would stall training for several minutes per step.
     """
-    seen: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
     unique = 0
     for seq in token_sequences:
-        is_dup = False
-        for prev in seen:
-            lcs_len = _lcs_length(seq, prev)
-            max_len = max(len(seq), len(prev), 1)
-            if lcs_len / max_len >= threshold:
-                is_dup = True
-                break
-        if not is_dup:
+        key = tuple(seq)
+        if key not in seen:
             unique += 1
-        seen.append(seq)
+            seen.add(key)
     return unique / max(len(token_sequences), 1)
 
 

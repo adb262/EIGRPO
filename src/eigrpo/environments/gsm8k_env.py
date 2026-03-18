@@ -8,7 +8,6 @@ for diversity analysis.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -18,7 +17,6 @@ from verl.utils.reward_score import gsm8k
 from eigrpo.environments.base_env import EIGRPOBaseTool
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class GSM8KTool(EIGRPOBaseTool):

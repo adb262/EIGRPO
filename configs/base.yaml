@@ -20,6 +20,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1  # TP=1 → DP=2 across GPUs (0.5B fits on one GPU)
     log_prob_micro_batch_size: 256
     dtype: bfloat16
+    free_cache_engine: false  # keep vLLM's KV cache and CUDA graphs resident across steps
     val_kwargs:
       n: 8
       do_sample: true
@@ -38,17 +39,18 @@ actor_rollout_ref:
       model_dtype: bfloat16
 eigrpo:
   selector:
-    name: uniform
+    name: eig
     n_effective_samples: 8
   diversity:
     log_gradient_norms: false
-    log_trajectory_similarity: false
+    log_trajectory_similarity: true
   environment:
     name: gsm8k
     reward_fn: eigrpo.environments.gsm8k_reward.compute_score
   logging:
     rollout_table_freq: 10      # log a wandb table every N steps; 0 = disabled
-    rollout_table_max_rows: 32  # max rows per table snapshot
+    rollout_table_max_rows: 32  # legacy field, unused by the selection table
+    rollout_table_max_groups: 2 # max prompt groups shown; each contributes G rows
 
 trainer:
   n_gpus_per_node: 2
@@ -57,6 +59,9 @@ trainer:
   profile_steps: []
   val_before_train: false
   test_freq: 100
+  save_freq: 300
+  default_hdfs_dir: null
+  default_local_dir: ./checkpoints
 
 ray_kwargs:
   ray_init:

@@ -13,6 +13,18 @@ import wandb
 
 logger = logging.getLogger("eigrpo")
 
+_LOG_FORMAT = "%(asctime)s  %(name)-24s  %(levelname)-8s  %(message)s"
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Configure the root logger with a consistent format.
+
+    Safe to call in any process (main driver or Ray worker): ``force=True``
+    clears any handlers that third-party libraries (Ray, verl, vLLM) may
+    have installed before this call runs.
+    """
+    logging.basicConfig(level=level, format=_LOG_FORMAT, force=True)
+
 
 class MetricsLogger:
     """Thin facade over console logging and wandb.
