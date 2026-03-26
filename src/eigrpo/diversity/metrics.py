@@ -14,53 +14,83 @@ import torch.nn as nn
 def compute_jacobian_rank(
     log_probs: torch.Tensor,
     response_mask: torch.Tensor,
+    group_size: int,
     rewards: torch.Tensor | None = None,
-    threshold: float = 0.01,
+    threshold: float = 0.1,
 ) -> dict[str, float]:
-    """Estimate the rank of the gradient Jacobian from the log-probability matrix.
+    """Estimate per-group gradient Jacobian rank from the log-probability matrix.
 
-    In GRPO the per-rollout gradient is ``A_i * ∇_θ log π_θ(o_i | q)``.
-    The log-probability matrix (N, seq_len) is used as a tractable proxy:
-    rollouts whose log-prob rows are linearly independent will produce
-    linearly independent gradients, so rank(L) ≤ rank(J).  Optionally
-    weight each row by ``|reward_i|`` to approximate the magnitude-weighted
-    Jacobian ``diag(|A|) * J``.
+    In GRPO the gradient decomposes per prompt group: each group contributes
+    ``A_i * ∇_θ log π_θ(o_i | q)`` where advantages are normalised within
+    the group.  A single global SVD across all P*G rollouts is dominated by
+    cross-group variation (different prompts live in different token-
+    distribution subspaces) and is insensitive to whether selection preserved
+    within-group diversity.
 
-    Returns both the numerical rank (singular values above
-    ``threshold * σ_max``) and the Roy–Vetterli effective rank
-    ``exp(H(σ̂))`` — the exponential of the normalised singular-value
-    entropy, which gives a continuous, noise-robust measure of
-    dimensionality in ``[1, N]``.
+    This function reshapes the (P*G, seq_len) log-prob matrix into P groups
+    of shape (G, seq_len), runs a separate SVD per group, and returns
+    statistics averaged across groups.
+
+    The log-prob rows are a tractable proxy for the true gradient vectors:
+    the policy gradient is a linear map of the masked log-probs, so
+    rank(log_prob_matrix) ≤ rank(true_Jacobian).  Optionally weight each
+    row by ``|reward_i|`` to approximate the reward-weighted Jacobian
+    ``diag(|A|) · J``.
 
     Parameters
     ----------
     log_probs:
-        Shape ``(N, seq_len)`` — token-level log-probabilities.
+        Shape ``(P*G, seq_len)`` — token-level log-probabilities.
     response_mask:
-        Shape ``(N, seq_len)`` — 1 for response tokens, 0 elsewhere.
+        Shape ``(P*G, seq_len)`` — 1 for response tokens, 0 elsewhere.
+    group_size:
+        G — number of rollouts per prompt group.
     rewards:
-        Shape ``(N,)`` — optional per-rollout scalar rewards used to
-        weight rows before the SVD.
+        Shape ``(P*G,)`` — optional per-rollout scalars used to weight each
+        log-prob row by ``|reward_i|``.
     threshold:
-        Fraction of the largest singular value below which a singular
-        value is treated as zero for the numerical rank computation.
+        Fraction of ``σ_max`` below which a singular value is treated as
+        zero for the hard numerical rank.
     """
-    masked = (log_probs * response_mask).float()              # (N, seq_len)
-    col_active = response_mask.any(dim=0)
-    masked = masked[:, col_active]                            # (N, active_len)
+    N, seq_len = log_probs.shape
+    G = group_size
+    P = N // G
 
+    masked = (log_probs * response_mask).float()              # (P*G, seq_len)
     if rewards is not None:
-        masked = masked * rewards.float().abs().unsqueeze(1)  # (N, active_len)
+        masked = masked * rewards.float().abs().unsqueeze(1)
 
-    sv = torch.linalg.svdvals(masked)                         # (min(N, L),)
+    masked = masked.view(P, G, seq_len)                       # (P, G, seq_len)
 
-    rank = int((sv > threshold * sv[0]).sum().item())
+    ranks: list[float] = []
+    eff_ranks: list[float] = []
 
-    sv_norm = sv / sv.sum().clamp(min=1e-12)
-    entropy = -(sv_norm * (sv_norm + 1e-10).log()).sum()
-    effective_rank = float(entropy.exp().item())
+    for p in range(P):
+        group_mat = masked[p]                                 # (G, seq_len)
+        col_active = group_mat.abs().any(dim=0)
+        group_mat = group_mat[:, col_active]                  # (G, active_len)
+        if group_mat.numel() == 0 or group_mat.shape[1] == 0:
+            continue
+        sv = torch.linalg.svdvals(group_mat)                  # (min(G, active_len),)
+        rank = int((sv > threshold * sv[0]).sum().item())
+        sv_norm = sv / sv.sum().clamp(min=1e-12)
+        entropy = -(sv_norm * (sv_norm + 1e-10).log()).sum()
+        eff_ranks.append(float(entropy.exp().item()))
+        ranks.append(float(rank))
 
-    return {"rank": float(rank), "effective_rank": effective_rank}
+    if not ranks:
+        return {"rank": 0.0, "effective_rank": 0.0, "rank_frac": 0.0, "effective_rank_frac": 0.0}
+
+    mean_rank = sum(ranks) / len(ranks)
+    mean_eff_rank = sum(eff_ranks) / len(eff_ranks)
+    return {
+        "rank": mean_rank,
+        "effective_rank": mean_eff_rank,
+        # Normalise by G so pre/post are on the same [0, 1] scale regardless
+        # of whether G=64 (pre) or G=n_select=8 (post).
+        "rank_frac": mean_rank / G,
+        "effective_rank_frac": mean_eff_rank / G,
+    }
 
 
 def compute_trajectory_similarity(
@@ -165,6 +195,7 @@ def compute_unique_trajectory_ratio(token_sequences: list[list[int]], threshold:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
 
 def _lcs_length(a: list[int], b: list[int]) -> int:
     """Length of the longest common subsequence between two int lists."""
