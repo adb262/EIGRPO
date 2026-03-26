@@ -72,6 +72,27 @@ def main(argv: list[str] | None = None) -> None:
         default="data/gsm8k",
         help="Directory for prepared GSM8K parquet files (auto-created if missing)",
     )
+    parser.add_argument(
+        "--experiment-name",
+        type=str,
+        default=None,
+        help=(
+            "Experiment name used for logging and checkpoint isolation. "
+            "Sets trainer.experiment_name and trainer.default_local_dir=./checkpoints/<name>. "
+            "Defaults to the value in the config file."
+        ),
+    )
+    parser.add_argument(
+        "--resume-mode",
+        type=str,
+        choices=["auto", "disable"],
+        default=None,
+        help=(
+            "Checkpoint resume behaviour. 'auto' resumes from the latest checkpoint if one "
+            "exists; 'disable' always starts from scratch. "
+            "Defaults to the value in the config file (currently 'auto')."
+        ),
+    )
     args, overrides = parser.parse_known_args(argv)
     logger.info("Starting EIGRPO training...")
 
@@ -90,6 +111,15 @@ def main(argv: list[str] | None = None) -> None:
         f"data.train_files={train_parquet}",
         f"data.val_files={val_parquet}",
     ]
+
+    if args.experiment_name is not None:
+        overrides += [
+            f"trainer.experiment_name={args.experiment_name}",
+            f"trainer.default_local_dir=./checkpoints/{args.experiment_name}",
+        ]
+
+    if args.resume_mode is not None:
+        overrides += [f"trainer.resume_mode={args.resume_mode}"]
 
     config = load_config(str(config_path), args.model, overrides)
     logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))

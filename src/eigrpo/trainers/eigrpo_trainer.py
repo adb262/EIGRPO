@@ -35,7 +35,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.tracking import Tracking
 
 from eigrpo.config import EIGRPOConfig, parse_eigrpo_config
-from eigrpo.diversity.metrics import compute_jacobian_rank, compute_unique_trajectory_ratio
+from eigrpo.diversity.metrics import compute_unique_trajectory_ratio
 from eigrpo.sampling.base_selector import BaseTrajectorySelector, TrajectoryBatch
 from eigrpo.trainers.rollout_batch import RolloutBatch
 from eigrpo.utils.metrics import compute_entropy, compute_mastery_pct, compute_min_log_prob
@@ -115,9 +115,10 @@ class EIGRPOTrainer(RayPPOTrainer):
     ) -> None:
         """Log a wandb Table showing every rollout and whether it was selected.
 
-        Each row corresponds to one rollout.  The ``selected`` column lets
-        readers see exactly which rollouts the sampler kept vs. dropped for
-        every prompt group shown.
+        Uses ``_log_group_id`` (stamped onto the batch before ``_balance_batch``
+        reorders rows by sequence length) to recover the correct prompt for each
+        row.  Without this, ``prompts[p * G]`` after reordering gives a row from
+        an arbitrary group, producing a prompt/response mismatch in the table.
 
         Skips silently when wandb is not active or the frequency guard fires.
         """
@@ -131,34 +132,41 @@ class EIGRPOTrainer(RayPPOTrainer):
         if wandb.run is None:
             return
 
-        G = self.config.actor_rollout_ref.rollout.n
         n_total = batch.batch.batch_size[0]
-        P = n_total // G
         max_groups = self._eigrpo_config.logging.rollout_table_max_groups
-        n_groups = min(P, max_groups)
 
         prompts = batch.batch["prompts"]
         responses = batch.batch["responses"]
         scores = batch.batch["token_level_scores"].sum(-1)
         selected_set = set(selected)
 
+        # _log_group_id[i] = original prompt-group that row i belongs to.
+        # Stamped before _balance_batch so it is reordered in lock-step with
+        # the tensor rows, letting us recover correct group membership after sort.
+        group_ids = batch.batch.get("_log_group_id")
+
         columns = ["step", "group", "rollout", "prompt", "response", "score", "selected"]
         table = wandb.Table(columns=columns)
 
-        for p in range(n_groups):
-            prompt_str = self.tokenizer.decode(prompts[p * G], skip_special_tokens=True)
-            for r in range(G):
-                idx = p * G + r
-                response_str = self.tokenizer.decode(responses[idx], skip_special_tokens=True)
-                table.add_data(
-                    step,
-                    p,
-                    r,
-                    prompt_str,
-                    response_str,
-                    scores[idx].item(),
-                    idx in selected_set,
-                )
+        if group_ids is not None:
+            unique_groups = group_ids.unique().tolist()
+            for gid in unique_groups[:max_groups]:
+                row_indices = (group_ids == gid).nonzero(as_tuple=True)[0].tolist()
+                prompt_str = self.tokenizer.decode(prompts[row_indices[0]], skip_special_tokens=True)
+                for r, idx in enumerate(row_indices):
+                    response_str = self.tokenizer.decode(responses[idx], skip_special_tokens=True)
+                    table.add_data(step, int(gid), r, prompt_str, response_str, scores[idx].item(), idx in selected_set)
+        else:
+            # Fallback when _log_group_id is absent (balance_batch=False):
+            # rows are still in original group order so p * G is valid.
+            G = self.config.actor_rollout_ref.rollout.n
+            P = n_total // G
+            for p in range(min(P, max_groups)):
+                prompt_str = self.tokenizer.decode(prompts[p * G], skip_special_tokens=True)
+                for r in range(G):
+                    idx = p * G + r
+                    response_str = self.tokenizer.decode(responses[idx], skip_special_tokens=True)
+                    table.add_data(step, p, r, prompt_str, response_str, scores[idx].item(), idx in selected_set)
 
         wandb.log({"eigrpo/selection_table": table}, step=step)
 
@@ -166,12 +174,32 @@ class EIGRPOTrainer(RayPPOTrainer):
     # Selection hook
     # ------------------------------------------------------------------
 
-    def _apply_selection(self, batch: DataProto, step: int) -> tuple[DataProto, dict[str, float]]:
+    def _extract_pre_jacobian_metrics(self, old_log_prob: DataProto) -> dict[str, float]:
+        """Extract pre-selection Jacobian rank from ``compute_log_prob`` output.
+
+        ``EIGRPOActorRolloutRefWorker.compute_log_prob`` stores gradient-sketch
+        rank metrics in ``meta_info["jacobian_pre_metrics"]``.  Each FSDP
+        worker has already all_reduced its sketch, so all workers return
+        identical dicts — we just take the value directly (no further
+        aggregation needed).
+        """
+        return old_log_prob.meta_info.get("jacobian_pre_metrics", {})
+
+    def _apply_selection(
+        self,
+        batch: DataProto,
+        step: int,
+        pre_jacobian_metrics: dict[str, float] | None = None,
+    ) -> tuple[DataProto, dict[str, float]]:
         """Filter the rollout batch and return EIGRPO metrics.
 
         Returns the (possibly filtered) batch and a flat metrics dict.
         Selection is a no-op when ``n_effective_samples`` is ``None``
         or >= the batch size.
+
+        ``pre_jacobian_metrics``: gradient-sketch rank computed during
+        ``compute_log_prob`` (passed in from the fit loop so we don't
+        repeat the forward pass).
         """
         rollout = RolloutBatch(batch)
         n_total = rollout.size
@@ -180,20 +208,12 @@ class EIGRPOTrainer(RayPPOTrainer):
 
         rewards = rollout.token_level_rewards.sum(dim=-1)
 
-        if rollout.old_log_probs is not None and rollout.response_mask is not None:
-            pre_rank = compute_jacobian_rank(
-                rollout.old_log_probs,
-                rollout.response_mask,
-                rewards=rewards,
-            )
-            metrics.update({f"jacobian/pre_{k}": v for k, v in pre_rank.items()})
+        if pre_jacobian_metrics:
+            metrics.update({f"jacobian/pre_{k}": v for k, v in pre_jacobian_metrics.items()})
 
         n_select = self._eigrpo_config.selector.n_effective_samples
         if n_select is None or n_select >= n_total:
             metrics["effective_batch_size"] = float(n_total)
-            if rollout.old_log_probs is not None and rollout.response_mask is not None:
-                metrics.update({f"jacobian/post_{k}": v for k, v in pre_rank.items()})
-            # No selection occurred — post stats equal pre stats.
             metrics["reward/post_mean"] = metrics["reward/pre_mean"]
             metrics["reward/post_min"] = metrics["reward/pre_min"]
             metrics["reward/post_max"] = metrics["reward/pre_max"]
@@ -237,14 +257,6 @@ class EIGRPOTrainer(RayPPOTrainer):
         metrics["reward/post_mean"] = post_rewards.mean().item()
         metrics["reward/post_min"] = post_rewards.min().item()
         metrics["reward/post_max"] = post_rewards.max().item()
-
-        if filtered_rollout.old_log_probs is not None and filtered_rollout.response_mask is not None:
-            post_rank = compute_jacobian_rank(
-                filtered_rollout.old_log_probs,
-                filtered_rollout.response_mask,
-                rewards=post_rewards,
-            )
-            metrics.update({f"jacobian/post_{k}": v for k, v in post_rank.items()})
 
         return filtered_batch, metrics
 
@@ -379,6 +391,9 @@ class EIGRPOTrainer(RayPPOTrainer):
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    _log_n = batch.batch["input_ids"].shape[0]
+                    _log_G = self.config.actor_rollout_ref.rollout.n
+                    batch.batch["_log_group_id"] = torch.arange(_log_n) // _log_G
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
@@ -406,6 +421,25 @@ class EIGRPOTrainer(RayPPOTrainer):
                                 return_dict=False,
                             )
 
+                    # Compute per-group reward statistics from all pre-selection rollouts
+                    # so both the pre- and post-selection Jacobian sketches can use the
+                    # same (μ_g, σ_g) baseline for advantage normalisation.  Only the
+                    # synchronous reward path has reward_tensor available here; in the
+                    # async path we skip and the actor falls back to unweighted loss for
+                    # both sketches, keeping them consistent with each other.
+                    if not self.config.reward_model.launch_reward_fn_async:
+                        _gs = self.config.actor_rollout_ref.rollout.n  # K pre-selection
+                        _per_resp = reward_tensor.sum(-1)               # (N,) terminal reward
+                        _P = _per_resp.shape[0] // _gs
+                        _r = _per_resp[: _P * _gs].view(_P, _gs)
+                        _mu = _r.mean(dim=1)                            # (P,)
+                        _sigma = _r.std(dim=1).clamp(min=1e-8)          # (P,)
+                        _mu_exp = _mu.unsqueeze(1).expand(_P, _gs).reshape(-1)
+                        _sig_exp = _sigma.unsqueeze(1).expand(_P, _gs).reshape(-1)
+                        batch.meta_info["pre_sketch_advantages"] = (_per_resp - _mu_exp) / _sig_exp
+                        batch.meta_info["pre_group_reward_mu"] = _mu
+                        batch.meta_info["pre_group_reward_sigma"] = _sigma
+
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:
@@ -417,6 +451,10 @@ class EIGRPOTrainer(RayPPOTrainer):
                     else:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            # Extract pre-selection Jacobian metrics piggy-backed by
+                            # EIGRPOActor.compute_log_prob (gradient sketch on the full
+                            # pre-selection batch, zero extra forward passes).
+                            pre_jacobian_metrics = self._extract_pre_jacobian_metrics(old_log_prob)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -439,6 +477,8 @@ class EIGRPOTrainer(RayPPOTrainer):
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
+                    if bypass_recomputing_logprobs:
+                        pre_jacobian_metrics: dict[str, float] = {}
 
                     if self.use_reference_policy:
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -479,7 +519,9 @@ class EIGRPOTrainer(RayPPOTrainer):
 
                         # ── EIGRPO: selection + metrics ──────────────
                         with marked_timer("selection", timing_raw):
-                            batch, eigrpo_metrics = self._apply_selection(batch, self.global_steps)
+                            batch, eigrpo_metrics = self._apply_selection(
+                                batch, self.global_steps, pre_jacobian_metrics
+                            )
                         metrics.update({f"eigrpo/{k}": v for k, v in eigrpo_metrics.items()})
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
@@ -506,10 +548,21 @@ class EIGRPOTrainer(RayPPOTrainer):
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # n_after = rollouts per prompt post-selection; EIGRPOActor
+                        # uses this to slice the batch into per-group sketch passes.
+                        batch.meta_info["group_size_post"] = n_after
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # rank retention: how much gradient diversity EIG preserved
+                        # effective_rank_frac is the primary metric (hard-threshold rank
+                        # always saturates at n_samples for large models and is uninformative).
+                        pre_eff = metrics.get("jacobian/pre_effective_rank_frac")
+                        post_eff = metrics.get("jacobian/post_effective_rank_frac")
+                        if pre_eff is not None and post_eff is not None and pre_eff > 0:
+                            metrics["jacobian/rank_retention"] = post_eff / pre_eff
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:

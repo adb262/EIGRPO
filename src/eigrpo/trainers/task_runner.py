@@ -10,11 +10,14 @@ from __future__ import annotations
 import logging
 from pprint import pprint
 
+import ray
 from omegaconf import OmegaConf
 
 from eigrpo.trainers.eigrpo_trainer import EIGRPOTrainer
 from eigrpo.utils.logging import configure_logging
+from eigrpo.workers.fsdp_worker import EIGRPOActorRolloutRefWorker
 from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
+from verl.trainer.ppo.ray_trainer import Role
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils import hf_processor, hf_tokenizer
@@ -25,8 +28,31 @@ from verl.utils.fs import copy_to_local
 
 class EIGRPOTaskRunner(TaskRunner):
     """TaskRunner that creates an :class:`EIGRPOTrainer` instead of
-    verl's default ``RayPPOTrainer``.
+    verl's default ``RayPPOTrainer``, and uses
+    :class:`~eigrpo.workers.fsdp_worker.EIGRPOActorRolloutRefWorker` so that
+    the ``compute_jacobian_rank`` remote method is available on the actor
+    worker group.
     """
+
+    def add_actor_rollout_worker(self, config):
+        """Override to substitute EIGRPOActorRolloutRefWorker for the default
+        AsyncActorRolloutRefWorker when the actor strategy is fsdp or fsdp2.
+
+        For any other strategy (megatron, engine) we fall back to the base
+        implementation — the Jacobian rank feature will simply be unavailable.
+        """
+        from verl.single_controller.ray import RayWorkerGroup
+
+        strategy = config.actor_rollout_ref.actor.strategy
+        if strategy in {"fsdp", "fsdp2"}:
+            actor_rollout_cls = EIGRPOActorRolloutRefWorker
+            ray_worker_group_cls = RayWorkerGroup
+            self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+            self.mapping[Role.ActorRollout] = "global_pool"
+            return actor_rollout_cls, ray_worker_group_cls
+
+        # Fallback for non-FSDP strategies.
+        return super().add_actor_rollout_worker(config)
 
     def run(self, config):
         configure_logging()
