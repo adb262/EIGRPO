@@ -64,6 +64,40 @@ The two runs share optimizer, rollout, seed, validation, and model settings.
 Their checkpoints go to separate directories and their Weights & Biases runs
 share the `grpo-reward-conditioning` project.
 
+## RC-GRPO baseline
+
+The repository also includes a GSM8K adaptation of
+[RC-GRPO](https://arxiv.org/abs/2602.03025). Unlike the no-SFT experiment
+above, this paper baseline has two stages:
+
+1. **RC-SFT** collects exploration rollouts, pairs each verified failure with
+   the corresponding expert GSM8K solution, and trains a 50/50 mixture labeled
+   with `<|high_reward|>` and `<|low_reward|>`.
+2. **RC-GRPO** samples one reward goal independently for each member of the
+   16-rollout group. It always uses ordinary correctness reward; low-reward
+   trajectories are not rewarded for being wrong. Validation always uses the
+   high-reward goal.
+
+Run RC-SFT on two GPUs (offline failure collection uses one GPU by default):
+
+```bash
+python3 experiments/scripts/run_rc_sft.py \
+    --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+The command writes a directly loadable Hugging Face model under
+`checkpoints/rc_sft/global_step_*/huggingface`. RC-GRPO automatically selects the
+latest one:
+
+```bash
+python3 experiments/scripts/run_rc_grpo.py
+```
+
+Prepared RC-SFT data is reused on subsequent runs. Use `--force-data-prep` to
+regenerate it, or `--skip-data-prep` when supplying existing
+`data/rc_sft/{train,test}.parquet` files. Both commands accept trailing Hydra
+dotlist overrides.
+
 
 ## Architecture Decisions
 
