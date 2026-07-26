@@ -74,9 +74,25 @@ above, this paper baseline has two stages:
    the corresponding expert GSM8K solution, and trains a 50/50 mixture labeled
    with `<|high_reward|>` and `<|low_reward|>`.
 2. **RC-GRPO** samples one reward goal independently for each member of the
-   16-rollout group. It always uses ordinary correctness reward; low-reward
-   trajectories are not rewarded for being wrong. Validation always uses the
-   high-reward goal.
+   16-rollout group. High-reward (GOOD) trajectories target a correct answer;
+   low-reward (BAD) trajectories target an incorrect answer that must still be
+   well formed and plausible. Validation always uses the high-reward goal.
+
+RC-GRPO uses one gated composite reward for both paths:
+
+```text
+0.25 * format_score + 0.25 * reasonability_score + 0.5 * target_match_score
+```
+
+All three components are in `[0, 1]`. A malformed response is hard-gated to
+`-1`; a format-valid response below the configured reasonability threshold
+(`0.25` by default) is hard-gated to `0`. `target_match_score` is correctness
+for HIGH/GOOD and inverted correctness for LOW/BAD. The GPT-4.1-mini
+reasonability judge receives the question and candidate response, but never the
+ground-truth answer, and is instructed not to evaluate factual or mathematical
+correctness. The hard format penalty and normalized four-dimension quality
+rubric are adapted from the
+[PNS reward](https://arxiv.org/abs/2602.03516).
 
 Run RC-SFT on two GPUs (offline failure collection uses one GPU by default):
 
@@ -93,6 +109,12 @@ latest one:
 python3 experiments/scripts/run_rc_grpo.py
 ```
 
+Set `OPENAI_API_KEY` before RC-GRPO so the reasonability judge can call the
+OpenAI Responses API. Independent rollout judgments run with bounded
+concurrency (`16` by default); adjust
+`reward_model.reward_kwargs.judge_max_concurrency` to fit the account's rate
+limits.
+
 Prepared RC-SFT data is reused on subsequent runs. Use `--force-data-prep` to
 regenerate it, or `--skip-data-prep` when supplying existing
 `data/rc_sft/{train,test}.parquet` files. Both commands accept trailing Hydra
@@ -103,8 +125,10 @@ dotlist overrides.
 
 **GSM8K is single-turn, no tool use.** GSM8K is a math reasoning benchmark
 where the model should solve problems via chain-of-thought, not tool calls.
-The reward function (`eigrpo.environments.gsm8k_reward`) uses strict
-`<answer>...</answer>` XML formatting with binary 1/0 rewards.
+The task verifier (`eigrpo.environments.gsm8k_reward`) uses strict
+`<answer>...</answer>` XML formatting with binary 1/0 accuracy. RC-GRPO wraps
+that verifier with the gated format/reasonability/target-match reward described
+above.
 
 **sglang remains the rollout backend.** verl's tool-call support (multi-turn
 agentic RL) only works with sglang, not vLLM. While GSM8K doesn't need

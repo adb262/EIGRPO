@@ -1,6 +1,24 @@
 custom_reward_function:
-  path: src/eigrpo/environments/reward_dispatch.py
+  path: src/eigrpo/environments/composite_reward.py
   name: compute_score
+  reward_kwargs:
+    judge_model: gpt-4.1-mini
+    format_weight: 0.25
+    reasonability_weight: 0.25
+    target_match_weight: 0.5
+    format_failure_reward: -1.0
+    reasonability_threshold: 0.25
+
+reward_manager:
+  source: importlib
+  name: ConcurrentRewardManager
+  module:
+    path: src/eigrpo/environments/concurrent_reward_manager.py
+    name: custom_reward_manager
+
+reward_model:
+  reward_kwargs:
+    judge_max_concurrency: 16
 
 algorithm:
   adv_estimator: grpo

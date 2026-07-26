@@ -18,6 +18,22 @@ def reward_goal_line(reward_goal: str) -> str:
     return f"{_REWARD_GOAL_PREFIX}{reward_goal}{_REWARD_GOAL_SUFFIX}"
 
 
+def reward_goal_from_text(text: str) -> str:
+    """Recover the unique RC-GRPO reward goal embedded in a rendered prompt."""
+    present = [goal for goal in VALID_REWARD_GOALS if goal in text]
+    if len(present) != 1:
+        raise ValueError(f"Expected exactly one RC-GRPO reward goal in prompt, found {present!r}")
+    return present[0]
+
+
+def reward_goal_from_messages(messages: list[dict]) -> str:
+    """Recover the goal from the raw messages preserved by verl's async loop."""
+    contents = [message.get("content", "") for message in messages]
+    if not all(isinstance(content, str) for content in contents):
+        raise ValueError("RC-GRPO raw_prompt messages must contain string content")
+    return reward_goal_from_text("\n".join(contents))
+
+
 def add_reward_goal_to_text(text: str, reward_goal: str) -> str:
     """Append a reward goal to a single-turn user prompt."""
     return f"{text.rstrip()}\n{reward_goal_line(reward_goal)}"

@@ -13,8 +13,9 @@ from eigrpo.rc_grpo.prompts import condition_rollout_prompts
 class RCGRPOTrainer(RayPPOTrainer):
     """RC-GRPO with per-trajectory reward-token sampling.
 
-    Only rollout prompts change. Rewards and GRPO advantages remain ordinary
-    task-success rewards, including for low-reward-conditioned trajectories.
+    Each rollout carries its sampled goal into the shared composite reward.
+    HIGH targets correctness; LOW targets a plausible, well-formed incorrect
+    response.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -31,7 +32,7 @@ class RCGRPOTrainer(RayPPOTrainer):
         is_validation = bool(batch.meta_info.get("validate", False))
         global_step = int(batch.meta_info.get("global_steps", 0))
         step_rng = random.Random(self._reward_goal_seed + global_step)
-        conditioned_prompts, reward_goals = condition_rollout_prompts(
+        conditioned_prompts, _ = condition_rollout_prompts(
             [list(raw_prompt) for raw_prompt in raw_prompts],
             rng=step_rng,
             high_reward_probability=self._high_reward_probability,
@@ -41,7 +42,6 @@ class RCGRPOTrainer(RayPPOTrainer):
         prompt_array = np.empty(len(conditioned_prompts), dtype=object)
         prompt_array[:] = conditioned_prompts
         batch.non_tensor_batch["raw_prompt"] = prompt_array
-        batch.non_tensor_batch["rc_reward_goal"] = np.array(reward_goals, dtype=object)
         return batch
 
     def fit(self):

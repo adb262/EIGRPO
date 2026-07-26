@@ -11,6 +11,8 @@ from eigrpo.rc_grpo.constants import HIGH_REWARD, LOW_REWARD
 from eigrpo.rc_grpo.prompts import (
     add_reward_goal_to_messages,
     condition_rollout_prompts,
+    reward_goal_from_messages,
+    reward_goal_from_text,
     reward_goal_line,
 )
 from eigrpo.rc_grpo.sft_data import build_balanced_rows, format_expert_response
@@ -21,6 +23,12 @@ def test_reward_goal_is_appended_to_first_user_message_without_mutation():
     conditioned = add_reward_goal_to_messages(messages, HIGH_REWARD)
     assert conditioned[0]["content"] == f"Solve this.\n{reward_goal_line(HIGH_REWARD)}"
     assert messages == [{"role": "user", "content": "Solve this."}]
+
+
+def test_reward_goal_can_be_recovered_from_rendered_prompt():
+    assert reward_goal_from_text(f"Solve this.\n{reward_goal_line(LOW_REWARD)}") == LOW_REWARD
+    messages = [{"role": "user", "content": f"Solve this.\n{reward_goal_line(HIGH_REWARD)}"}]
+    assert reward_goal_from_messages(messages) == HIGH_REWARD
 
 
 def test_training_conditions_are_sampled_per_rollout():
@@ -68,9 +76,20 @@ def test_expert_response_replaces_gsm8k_marker():
     assert format_expert_response("Add them.\n#### 1,234") == "Add them.\n<answer>1234</answer>"
 
 
-def test_rc_grpo_config_uses_standard_reward_and_paper_mixture():
+def test_rc_grpo_config_uses_gated_composite_reward_and_paper_mixture():
     config = yaml.safe_load(Path("configs/rc_grpo.yaml").read_text())
-    assert config["custom_reward_function"]["path"].endswith("reward_dispatch.py")
+    reward_config = config["custom_reward_function"]
+    assert reward_config["path"].endswith("composite_reward.py")
+    assert reward_config["reward_kwargs"] == {
+        "judge_model": "gpt-4.1-mini",
+        "format_weight": 0.25,
+        "reasonability_weight": 0.25,
+        "target_match_weight": 0.5,
+        "format_failure_reward": -1.0,
+        "reasonability_threshold": 0.25,
+    }
+    assert config["reward_manager"]["name"] == "ConcurrentRewardManager"
+    assert config["reward_model"]["reward_kwargs"]["judge_max_concurrency"] == 16
     assert config["actor_rollout_ref"]["rollout"]["n"] == 16
     assert config["actor_rollout_ref"]["rollout"]["mode"] == "async"
     assert config["rc_grpo"]["high_reward_probability"] == 0.5
