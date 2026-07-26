@@ -1,0 +1,68 @@
+custom_reward_function:
+  path: src/eigrpo/conditioning/reward.py
+  name: compute_score
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+data:
+  train_batch_size: 16
+  max_prompt_length: 1024
+  max_response_length: 2048
+  val_max_samples: 200
+  shuffle: true
+  seed: 42
+  conditioning_seed: 42
+  dataloader_num_workers: 0
+  custom_cls:
+    path: src/eigrpo/conditioning/dataset.py
+    name: RewardConditionedDataset
+
+actor_rollout_ref:
+  model:
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  rollout:
+    n: 16
+    name: vllm
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 64
+    dtype: bfloat16
+    free_cache_engine: false
+    val_kwargs:
+      n: 8
+      do_sample: true
+  actor:
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 64
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    fsdp_config:
+      model_dtype: bfloat16
+  ref:
+    log_prob_micro_batch_size_per_gpu: 16
+    fsdp_config:
+      model_dtype: bfloat16
+
+trainer:
+  n_gpus_per_node: 2
+  nnodes: 1
+  total_epochs: 3
+  val_before_train: true
+  test_freq: 100
+  save_freq: 300
+  default_hdfs_dir: null
+  default_local_dir: ./checkpoints/grpo_conditioned
+  logger: ["console", "wandb"]
+  project_name: grpo-reward-conditioning
+  experiment_name: conditioned-grpo
+
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+
+transfer_queue:
+  enable: false

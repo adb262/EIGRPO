@@ -1,6 +1,6 @@
 outputs/
 wandb/
 .venv/
-data/
+/data/
 **/__pycache__/
 *.pyc

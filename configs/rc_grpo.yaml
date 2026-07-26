@@ -1,0 +1,87 @@
+custom_reward_function:
+  path: src/eigrpo/environments/composite_reward.py
+  name: compute_score
+  reward_kwargs:
+    judge_model: gpt-4.1-mini
+    format_weight: 0.25
+    reasonability_weight: 0.25
+    target_match_weight: 0.5
+    format_failure_reward: -1.0
+    reasonability_threshold: 0.25
+
+reward_manager:
+  source: importlib
+  name: ConcurrentRewardManager
+  module:
+    path: src/eigrpo/environments/concurrent_reward_manager.py
+    name: custom_reward_manager
+
+reward_model:
+  reward_kwargs:
+    judge_max_concurrency: 16
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+data:
+  train_batch_size: 16
+  max_prompt_length: 1024
+  max_response_length: 2048
+  val_max_samples: 200
+  shuffle: true
+  seed: 42
+  dataloader_num_workers: 0
+
+actor_rollout_ref:
+  model:
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  rollout:
+    n: 16
+    name: vllm
+    mode: async
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 64
+    dtype: bfloat16
+    free_cache_engine: false
+    val_kwargs:
+      n: 8
+      do_sample: true
+  actor:
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 64
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    fsdp_config:
+      model_dtype: bfloat16
+  ref:
+    log_prob_micro_batch_size_per_gpu: 16
+    fsdp_config:
+      model_dtype: bfloat16
+
+rc_grpo:
+  high_reward_probability: 0.5
+  seed: 42
+
+trainer:
+  n_gpus_per_node: 2
+  nnodes: 1
+  total_epochs: 3
+  val_before_train: true
+  test_freq: 100
+  save_freq: 300
+  default_hdfs_dir: null
+  default_local_dir: ./checkpoints/rc_grpo
+  logger: ["console", "wandb"]
+  project_name: grpo-reward-conditioning
+  experiment_name: rc-grpo
+
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+
+transfer_queue:
+  enable: false
